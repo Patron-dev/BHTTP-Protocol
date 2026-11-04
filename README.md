@@ -1,4 +1,4 @@
-Túnel SSH por HTTP 🔒✨
+Túnel SSH 🐉🔑🧑🏻‍💻
 
 - Instalación manual
 - Ligero y estable
