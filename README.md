@@ -19,6 +19,9 @@ Túnel SSH 🐉🔑🧑🏻‍💻
 Ejecuta los siguientes comandos en tu VPS:
 
 git clone https://github.com/Patron-dev/BHTTP-Protocol
+
 cd BHTTP-Protocol
+
 chmod +x bhttp.sh
+
 ./bhttp.sh
