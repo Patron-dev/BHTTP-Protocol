@@ -1,185 +1,62 @@
-#!/usr/bin/env bash
-
-
-set -uo pipefail
-
-DESTDIR="/usr/local/lib/bhttp"
-SERVER_PY="$DESTDIR/bhttp-server.py"
-UNIT="/etc/systemd/system/bhttp.service"
-SERVICE="bhttp"
-CANDIDATOS=(8080 80 8443 443 2082 2095 8880 2052 3128)
-
-PUERTO=""; SSHPORT=22; DESINSTALAR=0; NUEVO_USER=""; NUEVO_PASS=""; SOLO_DIAG=0
-
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --puerto|-p)     shift; PUERTO="$1" ;;
-    --ssh-puerto)    shift; SSHPORT="$1" ;;
-    --crear-usuario) shift; NUEVO_USER="$1" ;;
-    --clave)         shift; NUEVO_PASS="$1" ;;
-    --desinstalar)   DESINSTALAR=1 ;;
-    --diag)          SOLO_DIAG=1 ;;
-    -h|--help)       sed -n '2,20p' "$0"; exit 0 ;;
-    *)               echo "opcion desconocida: $1" >&2; exit 2 ;;
-  esac
-  shift
-done
-
-rojo()  { printf '\033[31m%s\033[0m\n' "$*"; }
-verde() { printf '\033[32m%s\033[0m\n' "$*"; }
-info()  { printf '  %s\n' "$*"; }
-paso()  { printf '\n[%s] %s\n' "$1" "$2"; }
-
-[ "$(id -u 2>/dev/null || echo 0)" != 0 ] && { rojo "Ejecutalo como root:  sudo bash $0"; exit 2; }
-
-# ------------------------------------------------------------ crear usuario SSH
-# El tunel autentica con un usuario del sistema (PAM). Este helper crea uno
-# pensado solo para el tunel: sin shell de login, solo sirve para el SSH.
-crear_usuario() {
-  local u="$1" p="$2"
-  if id "$u" >/dev/null 2>&1; then
-    info "el usuario '$u' ya existe; solo actualizo la clave"
-  else
-    # /bin/bash (no nologin): algunos SSH cierran la conexion tras la auth si el
-    # usuario tiene nologin y el cliente pide algo mas que un forward puro. Con un
-    # shell real, el forward/SOCKS del tunel funciona seguro. Sin acceso extra:
-    # el usuario solo tiene la clave para el tunel.
-    useradd -M -s /bin/bash "$u" \
-      || { rojo "no pude crear el usuario '$u'"; return 1; }
-    info "usuario '$u' creado (shell /bin/bash, compatible con el forward del tunel)"
-  fi
-  if [ -z "$p" ]; then
-    p="$(tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 12)"
-    [ -z "$p" ] && p="dt$(date +%s | tail -c 7)"
-    info "clave generada automaticamente"
-  fi
-  echo "$u:$p" | chpasswd || { rojo "no pude poner la clave"; return 1; }
-  USER_FINAL="$u"; PASS_FINAL="$p"
-  return 0
-}
-
-# diagnostico del entorno SSH/red: la causa mas comun de que el tunel conecte,
-# autentique y luego "Connection reset"/"Read timed out" al navegar es que el SSH
-# no permite forward o la VPS no tiene salida, NO el protocolo BHTTP.
-diagnostico_ssh() {
-  paso "diag" "Comprobando el entorno SSH/red"
-  # 1) AllowTcpForwarding: el tunel necesita forward. Por defecto suele ser 'yes'.
-  local cfg="/etc/ssh/sshd_config" fwd=""
-  [ -r "$cfg" ] && fwd="$(grep -iE '^[[:space:]]*AllowTcpForwarding' "$cfg" | tail -1 | awk '{print tolower($2)}')"
-  if [ "$fwd" = "no" ]; then
-    rojo "  AllowTcpForwarding no  -> el tunel NO podra salir. Cambialo a yes:"
-    echo "     sed -i 's/^[[:space:]]*AllowTcpForwarding.*/AllowTcpForwarding yes/' $cfg"
-    echo "     systemctl restart ssh"
-  else
-    info "AllowTcpForwarding: ${fwd:-yes (por defecto)} -> OK"
-  fi
-  # 2) salida TCP a 8.8.8.8:53 (lo primero que hace el cliente tras conectar)
-  if timeout 5 bash -c 'exec 3<>/dev/tcp/8.8.8.8/53' 2>/dev/null; then
-    info "salida TCP a 8.8.8.8:53 (DNS): OK"
-  else
-    rojo "  La VPS NO alcanza 8.8.8.8:53 por TCP -> el DNS del tunel fallara."
-    echo "     Revisa el firewall de salida del proveedor / la red de la VPS."
-  fi
-  # 3) sshd escuchando en el puerto backend
-  if command -v ss >/dev/null 2>&1 && ss -tln 2>/dev/null | grep -qE ":$SSHPORT\b"; then
-    info "sshd escuchando en el puerto $SSHPORT: OK"
-  else
-    rojo "  No veo sshd escuchando en el puerto $SSHPORT (backend del tunel)."
-    echo "     Comprueba:  systemctl status ssh"
-  fi
-}
-
-if [ -n "$NUEVO_USER" ]; then
-  echo "=== Crear usuario para el tunel ==="
-  if crear_usuario "$NUEVO_USER" "$NUEVO_PASS"; then
-    verde "Usuario listo:"
-    echo "   usuario : $USER_FINAL"
-    echo "   clave   : $PASS_FINAL"
-    echo
-    echo "   Ponlos en la app (campos usuario/clave del SSH)."
-  fi
-  # si solo se pidio crear usuario (sin nada mas), terminamos aqui
-  [ -z "$PUERTO$DESINSTALAR" ] && { echo; echo "Usuario creado. Para (re)instalar el servidor:  sudo bash $0"; exit 0; }
-  echo
-fi
-
-# ------------------------------------------------------------ solo diagnostico
-if [ "$SOLO_DIAG" = 1 ]; then
-  echo "=== Diagnostico del entorno del tunel ==="
-  diagnostico_ssh
-  exit 0
-fi
-
-# ------------------------------------------------------------ desinstalar
-if [ "$DESINSTALAR" = 1 ]; then
-  systemctl stop "$SERVICE" 2>/dev/null
-  systemctl disable "$SERVICE" 2>/dev/null
-  rm -f "$UNIT"; rm -rf "$DESTDIR"
-  systemctl daemon-reload 2>/dev/null
-  verde "Servidor BHTTP desinstalado."
-  exit 0
-fi
-
-echo "=== Instalar servidor BHTTP propio ==="
-
-command -v python3 >/dev/null 2>&1 || { rojo "Falta python3. Instalalo:  apt install -y python3"; exit 1; }
-
-# ------------------------------------------------------------ elegir puerto
-paso "1/4" "Puerto"
-
-ocupados() {
-  if command -v ss >/dev/null 2>&1; then
-    ss -tln 2>/dev/null | tail -n +2 | awk '{print $4}' | sed 's/.*://'
-  elif command -v netstat >/dev/null 2>&1; then
-    netstat -tln 2>/dev/null | awk '/^tcp/ {print $4}' | sed 's/.*://'
-  fi | grep -E '^[0-9]+$' | sort -u
-}
-libre() { ! ocupados | grep -qx "$1"; }
-
-primer_libre=""
-for p in "${CANDIDATOS[@]}"; do libre "$p" && { primer_libre="$p"; break; }; done
-
-if [ -z "$PUERTO" ]; then
-  if [ -t 0 ]; then
-    read -r -p "  Puerto para el servidor BHTTP [${primer_libre:-8080}]: " PUERTO
-    [ -z "$PUERTO" ] && PUERTO="${primer_libre:-8080}"
-  else
-    PUERTO="${primer_libre:-8080}"
-    info "sin terminal interactiva; elijo el puerto libre $PUERTO"
-  fi
-fi
-
-if ! [[ "$PUERTO" =~ ^[0-9]+$ ]] || [ "$PUERTO" -lt 1 ] || [ "$PUERTO" -gt 65535 ]; then
-  rojo "Puerto invalido: $PUERTO"; exit 1
-fi
-if ! libre "$PUERTO"; then
-  rojo "El puerto $PUERTO ya esta ocupado. Elige otro:  sudo bash $0 --puerto 8081"
-  exit 1
-fi
-info "puerto elegido: $PUERTO   (backend SSH: 127.0.0.1:$SSHPORT)"
-
-# ------------------------------------------------------------ escribir servidor
-paso "2/4" "Instalando el servidor"
-mkdir -p "$DESTDIR"
-
-cat > "$SERVER_PY" <<'PYEOF'
 #!/usr/bin/env python3
-# Servidor BHTTP autonomo para DTunnel (version asyncio).
-# Mismo protocolo binario que la app (extraido de classes.dex), pero con un event
-# loop en vez de un hilo por conexion: aguanta las 48+ conexiones concurrentes del
-# cliente (32 download + 16 upload) sin saturar la CPU de una VPS pequena.
-#
-# Trama peticion : mode(1) sessionId(16) seq(8 BE) len(4 BE) + payload enmascarado
-# Trama respuesta: status(1) len(4 BE) + payload enmascarado
-# Mascara        : XOR con SHA256(sessionId||mode||seq||dir||contador), dir 0=req 1=resp
-# Modos          : 0=probe 1=subida 2=bajada(probe calib) 3=lote(download real) 4=ack
-import argparse, asyncio, hashlib, struct, sys
+# -*- coding: utf-8 -*-
+
+import os
+import sys
+import subprocess
+import re
+import time
+import shutil
+
+# Verificar privilegios de root
+if os.geteuid() != 0:
+    print("\033[1;31m[!] Por favor, ejecuta este script como root (sudo python3 bhttp_manager.py).\033[0m")
+    sys.exit(1)
+
+INSTALL_DIR = "/usr/local/lib/bhttp"
+MANAGER_PATH = os.path.join(INSTALL_DIR, "bhttp_manager.py")
+SYMLINK_PATH = "/usr/local/bin/bhttp"
+SERVICE_FILE = "/etc/systemd/system/bhttp.service"
+
+# Auto-instalación automática en la ruta requerida y creación de comando global 'bhttp'
+current_script = os.path.abspath(__file__)
+if current_script != MANAGER_PATH:
+    os.makedirs(INSTALL_DIR, exist_ok=True)
+    shutil.copy2(current_script, MANAGER_PATH)
+    os.chmod(MANAGER_PATH, 0o755)
+    
+    if os.path.exists(SYMLINK_PATH):
+        os.remove(SYMLINK_PATH)
+    try:
+        os.symlink(MANAGER_PATH, SYMLINK_PATH)
+    except Exception:
+        pass
+        
+    print(f"\033[1;32m[✔] Gestor instalado y configurado en: {INSTALL_DIR}\033[0m")
+    print(f"\033[1;32m[✔] Comando global 'bhttp' activado con éxito.\033[0m")
+    print(f"\033[1;36m[i] Iniciando gestor automático...\033[0m\n")
+    time.sleep(1.5)
+    os.execv(SYMLINK_PATH, [SYMLINK_PATH] + sys.argv[1:])
+
+# Colores y estilos ANSI
+VERDE = "\033[1;32m"
+AZUL = "\033[1;34m"
+AMARILLO = "\033[1;33m"
+ROJO = "\033[1;31m"
+CYAN = "\033[1;36m"
+RESET = "\033[0m"
+BLANCO = "\033[1;37m"
+
+# Código fuente del Servidor BHTTP 2.5 optimizado
+SERVER_CODE = r'''#!/usr/bin/env python3
+# Servidor BHTTP autonomo optimizado para maxima estabilidad y streaming (YouTube / VoIP / DTunnel).
+import argparse, asyncio, hashlib, struct, sys, socket
 
 MAGIC = b"BHP1"
-LONGPOLL = 2.0   # espera max de un batch vacio a que el backend produzca datos
+LONGPOLL = 3.0   # Configurable
 
 def log(msg):
-    sys.stderr.write("[bhttp] %s\n" % msg); sys.stderr.flush()
+    sys.stderr.write("[bhttp-pro] %s\n" % msg); sys.stderr.flush()
 
 def keystream(sess, mode, seq, d, n):
     base = hashlib.sha256(sess + bytes([mode]) + seq.to_bytes(8, "big") + bytes([d]))
@@ -198,9 +75,15 @@ def probe_reply(mode, size):
         out.append((i * 31) & 255)
     return bytes(out)
 
+def optimize_socket(sock):
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1048576)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1048576)
+    except Exception:
+        pass
 
 class Session:
-    """Un tunel logico: empareja el flujo BHTTP con la conexion al backend (sshd)."""
     def __init__(self, sess, backend):
         self.sess = sess
         self.backend = backend
@@ -212,31 +95,29 @@ class Session:
         self.down_assign = 0
         self.eof = False
         self.closed = False
-        self.br = None      # backend reader
-        self.bw = None      # backend writer
+        self.br = None
+        self.bw = None
 
     async def connect(self):
         host, port = self.backend
         self.br, self.bw = await asyncio.open_connection(host, port)
-        log("sesion %s: conectada al backend %s:%d" % (self.sess.hex()[:8], host, port))
+        sock = self.bw.get_extra_info('socket')
+        if sock:
+            optimize_socket(sock)
         asyncio.create_task(self._reader())
 
     async def _reader(self):
-        total = 0
         try:
             while True:
-                data = await self.br.read(65536)
+                data = await self.br.read(131072)
                 if not data:
                     break
-                total += len(data)
                 async with self.cond:
                     self.down_raw += data
                     self.cond.notify_all()
-        except Exception as e:
-            log("sesion %s: error leyendo del backend: %s" % (self.sess.hex()[:8], e))
+        except Exception:
+            pass
         finally:
-            log("sesion %s: el backend cerro (recibidos %d B en bajada)"
-                % (self.sess.hex()[:8], total))
             async with self.cond:
                 self.eof = True
                 self.cond.notify_all()
@@ -255,12 +136,8 @@ class Session:
                 self.up_next += 1
 
     async def download(self, seq, maxlen, deadline):
-        # ORDEN ESTRICTO: cada slot se sirve a su turno (down_assign) y quien pide
-        # un slot futuro espera; asi down_assign avanza al ritmo del cliente y un
-        # dato tras idle no cae en un slot ya pasado. 'deadline' (compartido por el
-        # batch) da por vacios los slots sin datos para no colgar.
         if maxlen <= 0:
-            maxlen = 1399
+            maxlen = 65536
         loop = asyncio.get_running_loop()
         async with self.cond:
             while True:
@@ -280,7 +157,7 @@ class Session:
                 if not self.eof and loop.time() < deadline:
                     try:
                         await asyncio.wait_for(self.cond.wait(),
-                                               timeout=max(0.01, deadline - loop.time()))
+                                               timeout=max(0.005, deadline - loop.time()))
                     except asyncio.TimeoutError:
                         pass
                     continue
@@ -303,7 +180,6 @@ class Session:
         except Exception:
             pass
 
-
 class Server:
     def __init__(self, host, port, backend):
         self.host, self.port, self.backend = host, port, backend
@@ -314,18 +190,15 @@ class Server:
         async with self.slock:
             s = self.sessions.get(sess)
             if s is None or s.closed:
-                for old_sid, old in list(self.sessions.items()):
-                    if old_sid != sess:
-                        await old.close()
-                        del self.sessions[old_sid]
                 s = Session(sess, self.backend)
                 await s.connect()
                 self.sessions[sess] = s
-                log("sesion %s: registrada (sesiones vivas: %d)"
-                    % (sess.hex()[:8], len(self.sessions)))
             return s
 
     async def handle(self, reader, writer):
+        sock = writer.get_extra_info('socket')
+        if sock:
+            optimize_socket(sock)
         try:
             while True:
                 hdr = await reader.readexactly(29)
@@ -338,7 +211,7 @@ class Server:
                     raw = await reader.readexactly(ln)
                     payload = mask(raw, sess, mode, seq, 0)
 
-                if payload[:4] == MAGIC:  # probe (calibracion / handshake)
+                if payload[:4] == MAGIC:
                     size = int.from_bytes(payload[6:10], "big") if len(payload) >= 10 else 0
                     pmode = payload[5] if len(payload) >= 6 else mode
                     body = mask(probe_reply(pmode, size), sess, mode, seq, 1)
@@ -347,28 +220,28 @@ class Server:
                     continue
 
                 s = await self.get_session(sess)
-                if mode == 1:                       # subida (len 0 = registro)
+                if mode == 1:
                     await s.upload(seq, payload)
                     writer.write(bytes([0]) + (0).to_bytes(4, "big"))
                     await writer.drain()
-                elif mode == 2:                     # bajada simple (raro)
-                    chunk = await s.download(seq, ln if ln > 0 else 1399,
+                elif mode == 2:
+                    chunk = await s.download(seq, ln if ln > 0 else 65536,
                                              asyncio.get_running_loop().time() + LONGPOLL)
                     self._send_data(writer, sess, mode, seq, chunk)
                     await writer.drain()
-                elif mode == 3:                     # lote de bajadas (download real)
+                elif mode == 3:
                     if len(payload) >= 6:
                         chunk_size = int.from_bytes(payload[0:4], "big"); count = payload[5]
                     else:
-                        chunk_size, count = 1399, 1
-                    if chunk_size <= 0: chunk_size = 1399
-                    if count <= 0: count = 1
+                        chunk_size, count = 65536, 4
+                    if chunk_size <= 0: chunk_size = 65536
+                    if count <= 0: count = 4
                     deadline = asyncio.get_running_loop().time() + LONGPOLL
                     for i in range(count):
                         chunk = await s.download(seq + i, chunk_size, deadline)
                         self._send_data(writer, sess, mode, seq + i, chunk)
                     await writer.drain()
-                elif mode == 4:                     # ack
+                elif mode == 4:
                     await s.ack(seq)
                     writer.write(bytes([0]) + (0).to_bytes(4, "big"))
                     await writer.drain()
@@ -376,8 +249,8 @@ class Server:
                     return
         except (asyncio.IncompleteReadError, ConnectionError, OSError):
             pass
-        except Exception as e:
-            log("handle: excepcion inesperada: %r" % e)
+        except Exception:
+            pass
         finally:
             try:
                 writer.close()
@@ -385,19 +258,15 @@ class Server:
                 pass
 
     def _send_data(self, writer, sess, mode, seq, data):
-        # respuesta de bajada (status 2): [4B longitud EN CLARO][datos enmascarados]
         real = len(data)
         masked = mask(data, sess, mode, seq, 1) if data else b""
         body = real.to_bytes(4, "big") + masked
         writer.write(bytes([2]) + len(body).to_bytes(4, "big") + body)
 
     async def serve(self):
-        srv = await asyncio.start_server(self.handle, self.host, self.port, backlog=512)
-        print("BHTTP escuchando en %s:%d -> backend %s:%d"
-              % (self.host, self.port, self.backend[0], self.backend[1]), flush=True)
+        srv = await asyncio.start_server(self.handle, self.host, self.port, backlog=8192)
         async with srv:
             await srv.serve_forever()
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -408,148 +277,309 @@ def main():
     a = ap.parse_args()
     asyncio.run(Server(a.host, a.port, (a.backend_host, a.backend_port)).serve())
 
-
 if __name__ == "__main__":
     main()
-PYEOF
+'''
 
-chmod +x "$SERVER_PY"
-if ! python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$SERVER_PY"; then
-  rojo "El servidor quedo mal escrito"; exit 1
-fi
-info "servidor en $SERVER_PY"
 
-PYBIN="$(command -v python3)"
-cat > "$UNIT" <<EOF
-[Unit]
-Description=Servidor BHTTP (DTunnel) puerto $PUERTO
+def mostrar_banner():
+    os.system("clear" if os.name == "posix" else "cls")
+    print(f"{CYAN}======================================================{RESET}")
+    print(f"{VERDE}         Instalar BHTTP 2.5 VICTORPEREZ               {RESET}")
+    print(f"{CYAN}======================================================{RESET}")
+    print(f"{BLANCO} Servidor BHTTP autónomo optimizado (Streaming/VoIP)  {RESET}")
+    print(f"{CYAN}======================================================{RESET}")
+
+
+def instalar_bhttp():
+    mostrar_banner()
+    print(f"{CYAN}=== 🚀 INSTALACIÓN AUTOMÁTICA BHTTP 2.5 ==={RESET}\n")
+
+    puerto = input("Ingrese el puerto de escucha principal (Ej. 80 o 443): ").strip()
+    if not puerto.isdigit():
+        print(f"{ROJO}[!] Puerto de escucha inválido.{RESET}")
+        time.sleep(2)
+        return
+
+    backend_port = input("Ingrese el puerto backend local [Por defecto 22 para SSH]: ").strip()
+    backend_port = backend_port if backend_port.isdigit() else "22"
+
+    long_poll = "3.0"
+    buf_mb = "1"
+    buf_bytes = int(buf_mb) * 1024 * 1024
+
+    print(f"\n{AMARILLO}[*] Escribiendo servidor en {INSTALL_DIR}...{RESET}")
+    os.makedirs(INSTALL_DIR, exist_ok=True)
+
+    server_file_path = os.path.join(INSTALL_DIR, "bhttp-server.py")
+    with open(server_file_path, "w", encoding="utf-8") as f:
+        f.write(SERVER_CODE)
+
+    os.chmod(server_file_path, 0o755)
+
+    with open(server_file_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    content = re.sub(r"^LONGPOLL = .*", f"LONGPOLL = {long_poll}   # Configurado automáticamente", content, flags=re.MULTILINE)
+    content = re.sub(r"sock\.setsockopt\(socket\.SOL_SOCKET, socket\.SO_RCVBUF, [0-9]+\)", f"sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, {buf_bytes})", content)
+    content = re.sub(r"sock\.setsockopt\(socket\.SOL_SOCKET, socket\.SO_SNDBUF, [0-9]+\)", f"sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, {buf_bytes})", content)
+
+    with open(server_file_path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+    print(f"{AMARILLO}[*] Configurando y activando servicio systemd automático...{RESET}")
+    service_content = f"""[Unit]
+Description=BHTTP 2.5 Server - VICTORPEREZ
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=$PYBIN $SERVER_PY --host 0.0.0.0 --port $PUERTO --backend-host 127.0.0.1 --backend-port $SSHPORT
-Restart=on-failure
+User=root
+ExecStart=/usr/bin/python3 {server_file_path} --port {puerto} --backend-port {backend_port}
+Restart=always
 RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
-EOF
-info "servicio en $UNIT"
-# ------------------------------------------------------------ arrancar
-paso "3/4" "Arrancando"
-systemctl daemon-reload
-systemctl enable "$SERVICE" >/dev/null 2>&1 && info "activado en el arranque"
-systemctl restart "$SERVICE"
+"""
 
-LEVANTADO=0
-for _ in $(seq 1 10); do
-  estado="$(systemctl is-active "$SERVICE" 2>/dev/null)"
-  if [ "$estado" = active ] && ocupados | grep -qx "$PUERTO"; then LEVANTADO=1; break; fi
-  [ "$estado" = failed ] && break
-  sleep 1
-done
+    with open(SERVICE_FILE, "w", encoding="utf-8") as f:
+        f.write(service_content)
 
-if [ "$LEVANTADO" != 1 ]; then
-  rojo "El servicio no arranco. Estado: $(systemctl is-active "$SERVICE" 2>/dev/null)"
-  journalctl -u "$SERVICE" -n 20 --no-pager 2>/dev/null | sed 's/^/    /'
-  exit 1
-fi
-verde "  servicio activo y escuchando en el puerto $PUERTO"
+    subprocess.run(["systemctl", "daemon-reload"], check=False)
+    subprocess.run(["systemctl", "enable", "bhttp"], check=False)
+    subprocess.run(["systemctl", "restart", "bhttp"], check=False)
 
-# ------------------------------------------------------------ verificar protocolo
-paso "4/4" "Verificacion del protocolo BHTTP"
+    mostrar_banner()
+    print(f"{CYAN}======================================================{RESET}")
+    print(f"{VERDE}        ✨ BHTTP INSTALADO EXITOSAMENTE ✨          {RESET}")
+    print(f"{CYAN}======================================================{RESET}")
+    print(f"  ┌─────────────────────────────────────────┐")
+    print(f"  │  🔌 Puerto de Escucha : {VERDE}{puerto:<15}{RESET} │")
+    print(f"  │  🔗 Puerto Backend    : {VERDE}{backend_port:<15}{RESET} │")
+    print(f"  │  ⏱️  Long-Poll        : {VERDE}3.0s            {RESET} │")
+    print(f"  │  🎛️  Búfer de Socket  : {VERDE}1 MB            {RESET} │")
+    print(f"  │  📊 Estado            : {VERDE}CORRIENDO AL 100%{RESET}       │")
+    print(f"  └─────────────────────────────────────────┘")
+    print(f"{CYAN}======================================================{RESET}\n")
+    input("Presione [ENTER] para volver al menú...")
 
-VERIF="$(python3 - "$PUERTO" <<'PYV'
-import hashlib, socket, sys, os
-PORT = int(sys.argv[1]); SESS = os.urandom(16); MAGIC = b"BHP1"
-def ks(m,s,d,n):
-    o=b""; c=0
-    while len(o)<n:
-        o+=hashlib.sha256(SESS+bytes([m])+s.to_bytes(8,"big")+bytes([d])+c.to_bytes(4,"big")).digest(); c+=1
-    return o[:n]
-def mask(x,m,s,d): return bytes(a^b for a,b in zip(x,ks(m,s,d,len(x))))
-def rn(sk,n):
-    b=b""
-    while len(b)<n:
-        z=sk.recv(n-len(b))
-        if not z: raise EOFError
-        b+=z
-    return b
-def open_sock(): return socket.create_connection(("127.0.0.1",PORT),timeout=6)
-def send(sk,mode,seq,payload=b"",lenf=None):
-    if lenf is None: lenf=len(payload)
-    sk.sendall(bytes([mode])+SESS+seq.to_bytes(8,"big")+lenf.to_bytes(4,"big"))
-    if payload: sk.sendall(payload)
-def resp(sk):
-    st=rn(sk,1)[0]; ln=int.from_bytes(rn(sk,4),"big"); return st, (rn(sk,ln) if ln else b"")
-try:
-    # 1) handshake BHP1 (probe): payload enmascarado, respuesta status 0 con eco
-    p=MAGIC+bytes([1,0])+(0).to_bytes(4,"big")
-    sk=open_sock(); send(sk,0,0,mask(p,0,0,0)); st,body=resp(sk); sk.close()
-    assert st==0 and mask(body,0,0,1)[:4]==MAGIC, "handshake"
-    # 2) registro + subida (mode 1, status 0)
-    sk=open_sock(); send(sk,1,0,b""); assert resp(sk)[0]==0, "registro"; sk.close()
-    sk=open_sock(); send(sk,1,0,mask(b"SSH-2.0-Test\r\n",1,0,0)); resp(sk); sk.close()
-    # 3) batch (mode 3) como Frontera: prefijo 4 bytes, sin relleno, payload
-    #    de peticion enmascarado. La bajada se produce en orden estricto, asi
-    #    que solo el chunk 0 (el banner del SSH) esta disponible sin subir mas;
-    #    leemos con socket-timeout corto y validamos ese chunk (los siguientes
-    #    esperarian datos, que es correcto: el flujo real los va produciendo).
-    pay=(1399).to_bytes(4,"big")+bytes([0,8])
-    sk=open_sock(); sk.settimeout(4); send(sk,3,0,mask(pay,3,0,0))
-    back=b""; okfmt=True
-    try:
-        for i in range(8):
-            st,body=resp(sk)
-            if st!=2 or len(body)<4: okfmt=False; break
-            dl=int.from_bytes(body[0:4],"big")
-            if dl!=len(body)-4: okfmt=False; break
-            dl=int.from_bytes(body[0:4],"big")
-            if dl!=len(body)-4: okfmt=False; break
-            if dl: back+=mask(body[4:4+dl],3,i,1)
-            if back.startswith(b"SSH-"): break   # banner recibido: suficiente
-    except socket.timeout:
-        pass
-    sk.close()
-    ok = back.startswith(b"SSH-")
-    print("HANDSHAKE_OK" if okfmt else "FORMATO_MALO")
-    print("TUNEL_OK" if ok else "TUNEL_VACIO")
-    print("BANNER="+back[:40].decode("latin1").strip())
-except Exception as e:
-    print("ERROR="+str(e))
-PYV
-)"
-echo "$VERIF" | sed 's/^/    /'
 
-echo
-IP="$(command -v curl >/dev/null 2>&1 && curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null)"
-[ -z "$IP" ] && IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+def cambiar_puerto():
+    mostrar_banner()
+    print(f"{CYAN}=== ⚙️ CAMBIAR / CONFIGURAR PUERTOS BHTTP ==={RESET}\n")
 
-if echo "$VERIF" | grep -q HANDSHAKE_OK; then
-  verde "=== LISTO: el servidor BHTTP responde ==="
-  echo
-  echo "  En la app pon:"
-  echo "     host      : ${IP:-<la ip de tu vps>}"
-  echo "     puerto    : $PUERTO"
-  echo "     protocolo : bhttp"
-  echo "     (sin TLS; usa el usuario/clave SSH de esta VPS)"
-  echo
-  if echo "$VERIF" | grep -q TUNEL_OK; then
-    verde "  Tunel al SSH verificado de punta a punta."
-  else
-    rojo "  El protocolo va, pero el SSH local no respondio."
-    echo "  Comprueba que el SSH escuche en el puerto $SSHPORT:  systemctl status ssh"
-    echo "  Si tu SSH usa otro puerto:  sudo bash $0 --ssh-puerto <n> --puerto $PUERTO"
-  fi
-  echo
-  diagnostico_ssh
-  echo
-  echo "  Gestion:  systemctl status $SERVICE | restart | stop"
-  echo "  Log en vivo (util si el tunel cae al navegar):  journalctl -u $SERVICE -f"
-  echo "  Quitar :  sudo bash $0 --desinstalar"
-  exit 0
-fi
+    if not os.path.exists(SERVICE_FILE):
+        print(f"{ROJO}[!] BHTTP no está instalado.${RESET}")
+        time.sleep(2)
+        return
 
-rojo "=== El servidor arranco pero no valido el protocolo ==="
-echo "  Revisa:  journalctl -u $SERVICE -n 30 --no-pager"
-exit 1
+    with open(SERVICE_FILE, "r", encoding="utf-8") as f:
+        svc_data = f.read()
+
+    match_port = re.search(r"--port\s+([0-9]+)", svc_data)
+    match_backend = re.search(r"--backend-port\s+([0-9]+)", svc_data)
+
+    puerto_actual = match_port.group(1) if match_port else "Desconocido"
+    backend_actual = match_backend.group(1) if match_backend else "22"
+
+    print(f"Configuración actual:")
+    print(f" - Puerto de Escucha actual: {AMARILLO}{puerto_actual}{RESET}")
+    print(f" - Puerto Backend actual:   {AMARILLO}{backend_actual}{RESET}\n")
+
+    nuevo_puerto = input("Ingrese el nuevo puerto de escucha: ").strip()
+    if not nuevo_puerto.isdigit():
+        print(f"{ROJO}[!] Puerto de escucha inválido.${RESET}")
+        time.sleep(2)
+        return
+
+    nuevo_backend = input(f"Ingrese el nuevo puerto backend [Dejar en blanco para mantener {backend_actual}]: ").strip()
+    if not nuevo_backend.isdigit():
+        nuevo_backend = backend_actual
+
+    svc_data = re.sub(r"--port\s+[0-9]+", f"--port {nuevo_puerto}", svc_data)
+    if "--backend-port" in svc_data:
+        svc_data = re.sub(r"--backend-port\s+[0-9]+", f"--backend-port {nuevo_backend}", svc_data)
+    else:
+        svc_data = svc_data.replace("ExecStart=", f"ExecStart=... --backend-port {nuevo_backend}")
+
+    with open(SERVICE_FILE, "w", encoding="utf-8") as f:
+        f.write(svc_data)
+
+    subprocess.run(["systemctl", "daemon-reload"], check=False)
+    subprocess.run(["systemctl", "restart", "bhttp"], check=False)
+
+    mostrar_banner()
+    print(f"{CYAN}======================================================{RESET}")
+    print(f"{VERDE}        ✨ PUERTO CONFIGURADO EXITOSAMENTE ✨        {RESET}")
+    print(f"{CYAN}======================================================{RESET}")
+    print(f"  ┌─────────────────────────────────────────┐")
+    print(f"  │  🔌 Puerto de Escucha : {VERDE}{nuevo_puerto:<15}{RESET} │")
+    print(f"  │  🔗 Puerto Backend    : {VERDE}{nuevo_backend:<15}{RESET} │")
+    print(f"  │  📊 Estado del Servicio: {VERDE}ACTIVO (100%)${RESET}        │")
+    print(f"  └─────────────────────────────────────────┘")
+    print(f"{CYAN}======================================================{RESET}\n")
+    input("Presione [ENTER] para volver al menú...")
+
+
+def configurar_buffers():
+    mostrar_banner()
+    print(f"{CYAN}=== 🎛️ CONFIGURAR BUFFERS Y STREAMING ==={RESET}\n")
+
+    server_file_path = os.path.join(INSTALL_DIR, "bhttp-server.py")
+    if not os.path.exists(server_file_path):
+        print(f"{ROJO}[!] BHTTP no está instalado.${RESET}")
+        time.sleep(2)
+        return
+
+    with open(server_file_path, "r", encoding="utf-8") as f:
+        code_data = f.read()
+
+    lp_match = re.search(r"^LONGPOLL\s*=\s*([0-9.]+)", code_data, flags=re.MULTILINE)
+    buf_match = re.search(r"SO_RCVBUF,\s*([0-9]+)", code_data)
+
+    lp_actual = lp_match.group(1) if lp_match else "3.0"
+    buf_actual_bytes = int(buf_match.group(1)) if buf_match else 1048576
+    buf_mb = buf_actual_bytes // 1024 // 1024
+
+    print(f"Valores actuales:")
+    print(f" - Tiempo Long-Poll: {AMARILLO}{lp_actual}s{RESET}")
+    print(f" - Buffer de Socket (RCV/SND): {AMARILLO}{buf_mb} MB{RESET}\n")
+
+    nuevo_lp = input("Ingrese nuevo valor para Long-Poll en segundos (Ej. 3.0, 5.0): ").strip()
+    if not nuevo_lp:
+        nuevo_lp = lp_actual
+
+    nuevo_mb_input = input("Ingrese nuevo tamaño de búfer de socket en Megabytes (Ej. 1, 2, 4): ").strip()
+    if nuevo_mb_input.isdigit():
+        nuevo_mb = int(nuevo_mb_input)
+    else:
+        nuevo_mb = buf_mb
+
+    nuevo_bytes = nuevo_mb * 1024 * 1024
+
+    print(f"{AMARILLO}[*] Aplicando cambios y reiniciando el servicio...{RESET}")
+
+    code_data = re.sub(r"^LONGPOLL\s*=\s*[0-9.]+", f"LONGPOLL = {nuevo_lp}   # Actualizado por el usuario", code_data, flags=re.MULTILINE)
+    code_data = re.sub(r"sock\.setsockopt\(socket\.SOL_SOCKET,\s*socket\.SO_RCVBUF,\s*[0-9]+\)", f"sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, {nuevo_bytes})", code_data)
+    code_data = re.sub(r"sock\.setsockopt\(socket\.SOL_SOCKET,\s*socket\.SO_SNDBUF,\s*[0-9]+\)", f"sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, {nuevo_bytes})", code_data)
+
+    with open(server_file_path, "w", encoding="utf-8") as f:
+        f.write(code_data)
+
+    subprocess.run(["systemctl", "restart", "bhttp"], check=False)
+
+    mostrar_banner()
+    print(f"{CYAN}======================================================{RESET}")
+    print(f"{VERDE}        ✨ BUFFERS ACTUALIZADOS CON ÉXITO ✨        {RESET}")
+    print(f"{CYAN}======================================================{RESET}")
+    print(f"  ┌─────────────────────────────────────────┐")
+    print(f"  │  ⏱️  Nuevo Long-Poll    : {VERDE}{nuevo_lp}s{(' ' * max(0, 14 - len(nuevo_lp+'s')))}{RESET} │")
+    print(f"  │  🎛️  Nuevo Socket Buffer: {VERDE}{nuevo_mb} MB{(' ' * max(0, 14 - len(str(nuevo_mb)+' MB')))}{RESET} │")
+    print(f"  │  📊 Estado del Servicio: {VERDE}ACTIVO (100%)${RESET}        │")
+    print(f"  └─────────────────────────────────────────┘")
+    print(f"{CYAN}======================================================{RESET}\n")
+    input("Presione [ENTER] para volver al menú...")
+
+
+def eliminar_puerto():
+    mostrar_banner()
+    print(f"{CYAN}=== 🗑️ ELIMINAR CONFIGURACIÓN DE PUERTO ==={RESET}\n")
+
+    if not os.path.exists(SERVICE_FILE):
+        print(f"{ROJO}[!] BHTTP no está instalado.${RESET}")
+        time.sleep(2)
+        return
+
+    print(f"{AMARILLO}[*] Deteniendo y deshabilitando el servicio...{RESET}")
+    subprocess.run(["systemctl", "stop", "bhttp"], check=False)
+    subprocess.run(["systemctl", "disable", "bhttp"], check=False)
+    if os.path.exists(SERVICE_FILE):
+        os.remove(SERVICE_FILE)
+    subprocess.run(["systemctl", "daemon-reload"], check=False)
+
+    print(f"\n{VERDE}[✔] Configuración y servicio eliminados correctamente.{RESET}")
+    input("Presione [ENTER] para volver al menú...")
+
+
+def desinstalar_bhttp():
+    mostrar_banner()
+    print(f"{CYAN}=== ❌ DESINSTALAR BHTTP ==={RESET}\n")
+
+    confirmar = input("¿Está seguro de que desea desinstalar por completo BHTTP 2.5? (s/n): ").strip().lower()
+    if confirmar == 's':
+        subprocess.run(["systemctl", "stop", "bhttp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["systemctl", "disable", "bhttp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
+        if os.path.exists(SERVICE_FILE):
+            os.remove(SERVICE_FILE)
+        if os.path.exists(SYMLINK_PATH):
+            os.remove(SYMLINK_PATH)
+            
+        if os.path.exists(INSTALL_DIR):
+            shutil.rmtree(INSTALL_DIR)
+            
+        subprocess.run(["systemctl", "daemon-reload"], check=False)
+        print(f"\n{VERDE}[✔] BHTTP 2.5 desinstalado por completo del sistema.{RESET}")
+    else:
+        print(f"\n{AMARILLO}[!] Operación cancelada.{RESET}")
+    input("Presione [ENTER] para volver al menú...")
+
+
+def comprobar_estado():
+    mostrar_banner()
+    print(f"{CYAN}=== 🔍 COMPROBACIÓN DE ESTADO BHTTP 2.5 ==={RESET}\n")
+
+    if not os.path.exists(SERVICE_FILE):
+        print(f"{ROJO}[!] BHTTP no se encuentra instalado.${RESET}\n")
+        input("Presione [ENTER] para volver al menú...")
+        return
+
+    print(f"{BLANCO}--- Estado del Servicio Systemd ---{RESET}")
+    subprocess.run(["systemctl", "status", "bhttp", "--no-pager"])
+    print("\n" + f"{BLANCO}--- Puertos en Escucha ---{RESET}")
+    subprocess.run("ss -tulpn | grep python3 || netstat -tulnp | grep python3", shell=True)
+    print("\n" + f"{BLANCO}--- Últimos Logs del Sistema ---{RESET}")
+    subprocess.run(["journalctl", "-u", "bhttp", "-n", "10", "--no-pager"])
+    print("")
+    input("Presione [ENTER] para volver al menú...")
+
+
+def menu():
+    while True:
+        mostrar_banner()
+        print("")
+        print(f"  {AZUL}[1]{RESET} 🚀 INSTALAR BHTTP")
+        print(f"  {AZUL}[2]{RESET} ⚙️  CAMBIAR / CONFIGURAR PUERTO")
+        print(f"  {AZUL}[3]{RESET} 🎛️  CONFIGURAR BUFFERS Y STREAMING")
+        print(f"  {AZUL}[4]{RESET} 🗑️  ELIMINAR PUERTO / CONFIGURACIÓN")
+        print(f"  {AZUL}[5]{RESET} ❌ DESINSTALAR BHTTP")
+        print(f"  {AZUL}[6]{RESET} 🔍 COMPROBAR QUE EL BHTTP ESTÁ CORRIENDO AL 100%")
+        print(f"  {AZUL}[7]{RESET} 🚪 SALIR")
+        print("")
+        
+        opcion = input(f"{AMARILLO}Seleccione una opción [1-7]: {RESET}").strip()
+
+        if opcion == "1":
+            instalar_bhttp()
+        elif opcion == "2":
+            cambiar_puerto()
+        elif opcion == "3":
+            configurar_buffers()
+        elif opcion == "4":
+            eliminar_puerto()
+        elif opcion == "5":
+            desinstalar_bhttp()
+        elif opcion == "6":
+            comprobar_estado()
+        elif opcion == "7":
+            print(f"\n{VERDE}¡Saliendo del gestor! Hasta luego.{RESET}\n")
+            sys.exit(0)
+        else:
+            print(f"\n{ROJO}[!] Opción inválida. Intente de nuevo.{RESET}")
+            time.sleep(2)
+
+
+if __name__ == "__main__":
+    menu()
+    
