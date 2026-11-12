@@ -26,8 +26,8 @@ port_in_use() {
   fi
 }
 install_server() {
-  local bhttp_port backend_port pybin
-  echo "Instalación BHTTP"
+  local bhttp_port backend_port pybin rcvbuf_kb sndbuf_kb write_high_kb write_low_kb
+  echo "Instalación BHTTP - configuración sencilla"
   read -r -p "Puerto BHTTP público: " bhttp_port
   if ! valid_port "$bhttp_port"; then error "Puerto BHTTP inválido."; return 1; fi
   if port_in_use "$bhttp_port"; then error "El puerto $bhttp_port ya está ocupado."; return 1; fi
@@ -37,6 +37,26 @@ install_server() {
   if ! valid_port "$backend_port"; then error "Puerto backend inválido."; return 1; fi
   if [[ "$bhttp_port" == "$backend_port" ]]; then
     error "El puerto BHTTP y el backend no pueden ser iguales."
+    return 1
+  fi
+
+  echo
+  echo "Búfer TCP en KB (0 = ajuste automático del sistema)."
+  read -r -p "Búfer de recepción [0]: " rcvbuf_kb
+  read -r -p "Búfer de envío [0]: " sndbuf_kb
+  read -r -p "Búfer de escritura asyncio [256]: " write_high_kb
+  rcvbuf_kb="${rcvbuf_kb:-0}"
+  sndbuf_kb="${sndbuf_kb:-0}"
+  write_high_kb="${write_high_kb:-256}"
+  write_low_kb=$((write_high_kb / 4))
+  for value in "$rcvbuf_kb" "$sndbuf_kb" "$write_high_kb"; do
+    if ! [[ "$value" =~ ^[0-9]+$ ]] || (( value > 16384 )); then
+      error "Búfer inválido. Usa un número entre 0 y 16384 KB."
+      return 1
+    fi
+  done
+  if (( write_high_kb < 16 )); then
+    error "El búfer de escritura debe ser al menos 16 KB."
     return 1
   fi
 
@@ -62,30 +82,34 @@ install_server() {
   mkdir -p "$DESTDIR"
   cat > "$SERVER_PY" <<'PYEOF'
 #!/usr/bin/env python3
-# Servidor BHTTP autónomo (Null) - asyncio
+# Servidor BHTTP autónomo - asyncio; formato de paquetes original conservado.
 import argparse, asyncio, hashlib, socket, sys
 MAGIC = b"BHP1"
-# Mantener el long-poll del protocolo para no cambiar su comportamiento.
+# Se conserva el tiempo de espera del protocolo original.
 LONGPOLL = 2.0
 
-def tune_writer(writer):
-    """Activa opciones TCP seguras sin modificar el formato BHTTP."""
+def tune_writer(writer, rcvbuf, sndbuf, write_high, write_low):
+    """Ajustes TCP opcionales; no cambian los paquetes BHTTP."""
     sock = writer.get_extra_info("socket")
-    if sock is None:
-        return
+    if sock is not None:
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            if hasattr(socket, "TCP_KEEPIDLE"):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+            if hasattr(socket, "TCP_KEEPINTVL"):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+            if hasattr(socket, "TCP_KEEPCNT"):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+            # 0 deja que Linux gestione automáticamente los buffers TCP.
+            if rcvbuf > 0:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcvbuf * 1024)
+            if sndbuf > 0:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, sndbuf * 1024)
+        except OSError as exc:
+            log("aviso: no se pudo aplicar una opción TCP: %s" % exc)
     try:
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        if hasattr(socket, "TCP_KEEPIDLE"):
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
-        if hasattr(socket, "TCP_KEEPINTVL"):
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 15)
-        if hasattr(socket, "TCP_KEEPCNT"):
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 4)
-    except OSError:
-        pass
-    try:
-        writer.transport.set_write_buffer_limits(high=1024 * 1024, low=256 * 1024)
+        writer.transport.set_write_buffer_limits(high=write_high, low=write_low)
     except (AttributeError, RuntimeError):
         pass
 def log(msg):
@@ -105,9 +129,11 @@ def probe_reply(mode, size):
         out.append((i * 31) & 255)
     return bytes(out)
 class Session:
-    def __init__(self, sess, backend):
+    def __init__(self, sess, backend, tuning):
         self.sess = sess
         self.backend = backend
+        self.tuning = tuning
+        self.up_lock = asyncio.Lock()
         self.cond = asyncio.Condition()
         self.up_next = 0
         self.up_pending = {}
@@ -120,8 +146,8 @@ class Session:
         self.bw = None
     async def connect(self):
         host, port = self.backend
-        self.br, self.bw = await asyncio.open_connection(host, port, limit=256 * 1024)
-        tune_writer(self.bw)
+        self.br, self.bw = await asyncio.open_connection(host, port, limit=self.tuning[4])
+        tune_writer(self.bw, *self.tuning[:4])
         log("sesion %s: conectada al backend %s:%d" % (self.sess.hex()[:8], host, port))
         asyncio.create_task(self._reader())
     async def _reader(self):
@@ -140,19 +166,26 @@ class Session:
             log("sesion %s: el backend cerro (recibidos %d B)" % (self.sess.hex()[:8], total))
             async with self.cond:
                 self.eof = True
+                self.closed = True
                 self.cond.notify_all()
     async def upload(self, seq, data):
-        async with self.cond:
-            if data:
-                self.up_pending[seq] = data
-            while self.up_next in self.up_pending:
-                chunk = self.up_pending.pop(self.up_next)
+        # No mantener el candado de descarga mientras drain() espera a TCP.
+        async with self.up_lock:
+            async with self.cond:
+                if data:
+                    self.up_pending[seq] = data
+            while True:
+                async with self.cond:
+                    chunk = self.up_pending.pop(self.up_next, None)
+                    if chunk is None:
+                        break
+                    self.up_next += 1
                 try:
                     self.bw.write(chunk)
                     await self.bw.drain()
-                except Exception:
+                except (ConnectionError, OSError):
                     self.closed = True
-                self.up_next += 1
+                    return
     async def download(self, seq, maxlen, deadline):
         if maxlen <= 0: maxlen = 1399
         loop = asyncio.get_running_loop()
@@ -192,8 +225,9 @@ class Session:
         try: self.bw.close()
         except Exception: pass
 class Server:
-    def __init__(self, host, port, backend):
+    def __init__(self, host, port, backend, tuning):
         self.host, self.port, self.backend = host, port, backend
+        self.tuning = tuning
         self.sessions = {}
         self.slock = asyncio.Lock()
     async def get_session(self, sess):
@@ -203,13 +237,13 @@ class Server:
                 # Cada identificador de sesión conserva su propio backend.
                 # No cerrar otras sesiones: eso provocaba cortes al conectar
                 # otro dispositivo o al abrir conexiones paralelas.
-                s = Session(sess, self.backend)
+                s = Session(sess, self.backend, self.tuning)
                 await s.connect()
                 self.sessions[sess] = s
                 log("sesion %s: registrada (vivas: %d)" % (sess.hex()[:8], len(self.sessions)))
             return s
     async def handle(self, reader, writer):
-        tune_writer(writer)
+        tune_writer(writer, *self.tuning[:4])
         try:
             while True:
                 hdr = await reader.readexactly(29)
@@ -270,7 +304,7 @@ class Server:
     async def serve(self):
         srv = await asyncio.start_server(
             self.handle, self.host, self.port,
-            backlog=2048, limit=256 * 1024, reuse_address=True
+            backlog=512, limit=self.tuning[4], reuse_address=True
         )
         print("BHTTP escuchando en %s:%d -> backend %s:%d" % (self.host, self.port, self.backend[0], self.backend[1]), flush=True)
         async with srv:
@@ -281,8 +315,16 @@ def main():
     ap.add_argument("--port", type=int, required=True)
     ap.add_argument("--backend-host", default="127.0.0.1")
     ap.add_argument("--backend-port", type=int, default=22)
+    ap.add_argument("--rcvbuf-kb", type=int, default=0)
+    ap.add_argument("--sndbuf-kb", type=int, default=0)
+    ap.add_argument("--write-high-kb", type=int, default=256)
+    ap.add_argument("--stream-limit-kb", type=int, default=256)
     a = ap.parse_args()
-    asyncio.run(Server(a.host, a.port, (a.backend_host, a.backend_port)).serve())
+    if min(a.rcvbuf_kb, a.sndbuf_kb) < 0 or not 16 <= a.write_high_kb <= 16384 or not 16 <= a.stream_limit_kb <= 16384:
+        ap.error("valores de búfer fuera de rango")
+    tuning = (a.rcvbuf_kb, a.sndbuf_kb, a.write_high_kb * 1024,
+              (a.write_high_kb // 4) * 1024, a.stream_limit_kb * 1024)
+    asyncio.run(Server(a.host, a.port, (a.backend_host, a.backend_port), tuning).serve())
 if __name__ == "__main__":
     main()
 PYEOF
@@ -299,7 +341,7 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-ExecStart=$pybin $SERVER_PY --host 0.0.0.0 --port $bhttp_port --backend-host 127.0.0.1 --backend-port $backend_port
+ExecStart=$pybin $SERVER_PY --host 0.0.0.0 --port $bhttp_port --backend-host 127.0.0.1 --backend-port $backend_port --rcvbuf-kb $rcvbuf_kb --sndbuf-kb $sndbuf_kb --write-high-kb $write_high_kb
 Restart=always
 RestartSec=2
 TimeoutStopSec=20
@@ -322,7 +364,10 @@ EOF
     echo "Instalación completada."
     echo "Puerto BHTTP: $bhttp_port"
     echo "Backend SSH: 127.0.0.1:$backend_port"
-    echo "Servicio: activo (inicio automático habilitado)"
+    echo "Buffer recepción TCP: ${rcvbuf_kb} KB (0 = automático)"
+    echo "Buffer envío TCP: ${sndbuf_kb} KB (0 = automático)"
+    echo "Buffer escritura asyncio: ${write_high_kb} KB"
+    echo "Servicio: activo (reinicio automático habilitado)"
     echo
     echo "Asegúrate de permitir el puerto BHTTP en el firewall de la VPS/proveedor."
   else
