@@ -18,25 +18,25 @@ MANAGER_PATH = os.path.join(INSTALL_DIR, "bhttp_manager.py")
 SYMLINK_PATH = "/usr/local/bin/bhttp"
 SERVICE_FILE = "/etc/systemd/system/bhttp.service"
 
-# Auto-instalación automática en la ruta requerida y creación de comando global 'bhttp'
+# Auto‑instalación sin reinicio por symlink
 current_script = os.path.abspath(__file__)
 if current_script != MANAGER_PATH:
     os.makedirs(INSTALL_DIR, exist_ok=True)
     shutil.copy2(current_script, MANAGER_PATH)
     os.chmod(MANAGER_PATH, 0o755)
-    
+
     if os.path.exists(SYMLINK_PATH):
         os.remove(SYMLINK_PATH)
     try:
         os.symlink(MANAGER_PATH, SYMLINK_PATH)
     except Exception:
         pass
-        
+
     print(f"\033[1;32m[✔] Gestor instalado y configurado en: {INSTALL_DIR}\033[0m")
     print(f"\033[1;32m[✔] Comando global 'bhttp' activado con éxito.\033[0m")
-    print(f"\033[1;36m[i] Iniciando gestor automático...\033[0m\n")
+    print(f"\033[1;36m[i] Menú BHTTP 2.5 cargado correctamente…\033[0m\n")
     time.sleep(1.5)
-    os.execv(SYMLINK_PATH, [SYMLINK_PATH] + sys.argv[1:])
+# ELIMINAMOS COMPLETAMENTE: os.execv(...)
 
 # Colores y estilos ANSI
 VERDE = "\033[1;32m"
@@ -582,4 +582,4 @@ def menu():
 
 if __name__ == "__main__":
     menu()
-    
+        
