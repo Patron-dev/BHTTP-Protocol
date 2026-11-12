@@ -63,31 +63,9 @@ install_server() {
   cat > "$SERVER_PY" <<'PYEOF'
 #!/usr/bin/env python3
 # Servidor BHTTP autónomo (Null) - asyncio
-import argparse, asyncio, hashlib, socket, sys
+import argparse, asyncio, hashlib, struct, sys
 MAGIC = b"BHP1"
-# Mantener el long-poll del protocolo para no cambiar su comportamiento.
 LONGPOLL = 2.0
-
-def tune_writer(writer):
-    """Activa opciones TCP seguras sin modificar el formato BHTTP."""
-    sock = writer.get_extra_info("socket")
-    if sock is None:
-        return
-    try:
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        if hasattr(socket, "TCP_KEEPIDLE"):
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
-        if hasattr(socket, "TCP_KEEPINTVL"):
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 15)
-        if hasattr(socket, "TCP_KEEPCNT"):
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 4)
-    except OSError:
-        pass
-    try:
-        writer.transport.set_write_buffer_limits(high=1024 * 1024, low=256 * 1024)
-    except (AttributeError, RuntimeError):
-        pass
 def log(msg):
     sys.stderr.write("[bhttp] %s\n" % msg); sys.stderr.flush()
 def keystream(sess, mode, seq, d, n):
@@ -120,8 +98,7 @@ class Session:
         self.bw = None
     async def connect(self):
         host, port = self.backend
-        self.br, self.bw = await asyncio.open_connection(host, port, limit=256 * 1024)
-        tune_writer(self.bw)
+        self.br, self.bw = await asyncio.open_connection(host, port)
         log("sesion %s: conectada al backend %s:%d" % (self.sess.hex()[:8], host, port))
         asyncio.create_task(self._reader())
     async def _reader(self):
@@ -200,16 +177,16 @@ class Server:
         async with self.slock:
             s = self.sessions.get(sess)
             if s is None or s.closed:
-                # Cada identificador de sesión conserva su propio backend.
-                # No cerrar otras sesiones: eso provocaba cortes al conectar
-                # otro dispositivo o al abrir conexiones paralelas.
+                for old_sid, old in list(self.sessions.items()):
+                    if old_sid != sess:
+                        await old.close()
+                        del self.sessions[old_sid]
                 s = Session(sess, self.backend)
                 await s.connect()
                 self.sessions[sess] = s
                 log("sesion %s: registrada (vivas: %d)" % (sess.hex()[:8], len(self.sessions)))
             return s
     async def handle(self, reader, writer):
-        tune_writer(writer)
         try:
             while True:
                 hdr = await reader.readexactly(29)
@@ -268,10 +245,7 @@ class Server:
         body = real.to_bytes(4, "big") + masked
         writer.write(bytes([2]) + len(body).to_bytes(4, "big") + body)
     async def serve(self):
-        srv = await asyncio.start_server(
-            self.handle, self.host, self.port,
-            backlog=2048, limit=256 * 1024, reuse_address=True
-        )
+        srv = await asyncio.start_server(self.handle, self.host, self.port, backlog=512)
         print("BHTTP escuchando en %s:%d -> backend %s:%d" % (self.host, self.port, self.backend[0], self.backend[1]), flush=True)
         async with srv:
             await srv.serve_forever()
@@ -301,12 +275,10 @@ StartLimitIntervalSec=0
 Type=simple
 ExecStart=$pybin $SERVER_PY --host 0.0.0.0 --port $bhttp_port --backend-host 127.0.0.1 --backend-port $backend_port
 Restart=always
-RestartSec=2
-TimeoutStopSec=20
+RestartSec=5
+TimeoutStopSec=15
 KillSignal=SIGINT
 LimitNOFILE=65535
-NoNewPrivileges=true
-PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
