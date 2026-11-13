@@ -1,119 +1,84 @@
 #!/usr/bin/env bash
-# BHTTP Control Panel — interfaz profesional sobre la versión estable.
-# El servidor Python y el protocolo se mantienen iguales a bhttp_installer_estable.sh.
+# Instalador sencillo del servidor BHTTP
 set -Eeuo pipefail
 
-APP="BHTTP CONTROL PANEL"
 DESTDIR="/usr/local/lib/bhttp"
 SERVER_PY="$DESTDIR/bhttp-server.py"
 UNIT="/etc/systemd/system/bhttp.service"
-CONF_DIR="/etc/bhttp"
-CONF="$CONF_DIR/bhttp.conf"
 SERVICE="bhttp"
 
-BHTTP_PORT=8080
-BACKEND_PORT=22
-RCVBUF_KB=0
-SNDBUF_KB=0
-WRITE_HIGH_KB=256
-STREAM_LIMIT_KB=256
-
-RESET='\033[0m'; BOLD='\033[1m'; DIM='\033[2m'
-CYAN='\033[36m'; BLUE='\033[34m'; GREEN='\033[32m'
-YELLOW='\033[33m'; RED='\033[31m'; WHITE='\033[97m'; MAGENTA='\033[35m'
-
-paint(){ printf '%b%s%b' "$1" "$2" "$RESET"; }
-line(){ printf '%b\n' "${DIM}  ─────────────────────────────────────────────────────────────${RESET}"; }
-ok(){ paint "$GREEN" "  ✓ $*"; printf '\n'; }
-info(){ paint "$CYAN" "  • $*"; printf '\n'; }
-warn(){ paint "$YELLOW" "  ! $*"; printf '\n'; }
-err(){ paint "$RED" "  ✗ $*" >&2; printf '\n' >&2; }
-pause(){ echo; read -r -p "  Presiona Enter para continuar..." _; }
-need_root(){ [[ $(id -u) -eq 0 ]] || { err "Ejecuta con sudo: sudo bash $0"; exit 1; }; }
-valid_port(){ [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
-valid_buffer(){ [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 <= 16384 )); }
-
-banner(){
-  clear 2>/dev/null || true
-  printf '%b\n' "${CYAN}${BOLD}  ____  _   _ _____ _____ ____  ${RESET}"
-  printf '%b\n' "${BLUE}${BOLD} | __ )| | | |_   _|_   _|  _ \\ ${RESET}"
-  printf '%b\n' "${CYAN}${BOLD} |  _ \\| |_| | | |   | | | |_) |${RESET}"
-  printf '%b\n' "${BLUE}${BOLD} | |_) |  _  | | |   | | |  __/ ${RESET}"
-  printf '%b\n' "${CYAN}${BOLD} |____/|_| |_| |_|   |_| |_|    ${RESET}"
-  printf '%b\n' "  ${WHITE}${BOLD}BHTTP CONTROL PANEL${RESET} ${DIM}· administración estable${RESET}"
-  local state="no instalado"
-  if command -v systemctl >/dev/null 2>&1 && [[ -f "$UNIT" ]]; then state="$(systemctl is-active "$SERVICE" 2>/dev/null || true)"; fi
-  printf '  Estado: '
-  case "$state" in active) paint "$GREEN" "● ACTIVO";; failed) paint "$RED" "● ERROR";; *) paint "$YELLOW" "● $state";; esac
-  printf '   Puerto: %s   Backend: %s\n' "${BHTTP_PORT:-—}" "${BACKEND_PORT:-22}"
-  line
-}
-
-load_config(){
-  mkdir -p "$CONF_DIR"
-  if [[ -f "$CONF" ]]; then
-    # Archivo escrito por este panel; únicamente contiene números.
-    source "$CONF"
+error() { echo "ERROR: $*" >&2; }
+need_root() {
+  if [[ "$(id -u)" -ne 0 ]]; then
+    error "Ejecuta como root: sudo bash $0"
+    exit 1
   fi
-  : "${BHTTP_PORT:=8080}" "${BACKEND_PORT:=22}" "${RCVBUF_KB:=0}" "${SNDBUF_KB:=0}" "${WRITE_HIGH_KB:=256}" "${STREAM_LIMIT_KB:=256}"
 }
-save_config(){
-  install -d -m 755 "$CONF_DIR"
-  cat > "$CONF" <<EOF
-BHTTP_PORT=$BHTTP_PORT
-BACKEND_PORT=$BACKEND_PORT
-RCVBUF_KB=$RCVBUF_KB
-SNDBUF_KB=$SNDBUF_KB
-WRITE_HIGH_KB=$WRITE_HIGH_KB
-STREAM_LIMIT_KB=$STREAM_LIMIT_KB
-EOF
-  chmod 600 "$CONF"
+valid_port() {
+  [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
 }
-
-write_service(){
-  local pybin; pybin="$(command -v python3)"
-  cat > "$UNIT" <<EOF
-[Unit]
-Description=BHTTP Server
-Wants=network-online.target
-After=network-online.target
-StartLimitIntervalSec=0
-
-[Service]
-Type=simple
-ExecStart=$pybin $SERVER_PY --host 0.0.0.0 --port $BHTTP_PORT --backend-host 127.0.0.1 --backend-port $BACKEND_PORT --rcvbuf-kb $RCVBUF_KB --sndbuf-kb $SNDBUF_KB --write-high-kb $WRITE_HIGH_KB --stream-limit-kb $STREAM_LIMIT_KB
-Restart=always
-RestartSec=2
-TimeoutStopSec=20
-KillSignal=SIGINT
-LimitNOFILE=65535
-NoNewPrivileges=true
-PrivateTmp=true
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  systemctl daemon-reload
-  systemctl enable "$SERVICE" >/dev/null
+port_in_use() {
+  if command -v ss >/dev/null 2>&1; then
+    ss -H -ltn 2>/dev/null | awk '{print $4}' |
+      grep -Eq "(:|\\])$1$"
+  else
+    return 1
+  fi
 }
-apply_config(){
-  save_config
-  if [[ ! -f "$SERVER_PY" ]]; then warn "Configuración guardada. Instala BHTTP primero."; return 0; fi
-  write_service
-  systemctl restart "$SERVICE"
-  sleep 2
-  if systemctl is-active --quiet "$SERVICE"; then ok "Configuración aplicada y servicio activo."; else err "No arrancó. Revisa Diagnóstico y registros."; return 1; fi
-}
+install_server() {
+  local bhttp_port backend_port pybin rcvbuf_kb sndbuf_kb write_high_kb write_low_kb
+  echo "Instalación BHTTP - configuración sencilla"
+  read -r -p "Puerto BHTTP público: " bhttp_port
+  if ! valid_port "$bhttp_port"; then error "Puerto BHTTP inválido."; return 1; fi
+  if port_in_use "$bhttp_port"; then error "El puerto $bhttp_port ya está ocupado."; return 1; fi
 
-install_server(){
+  read -r -p "Puerto backend SSH [22]: " backend_port
+  backend_port="${backend_port:-22}"
+  if ! valid_port "$backend_port"; then error "Puerto backend inválido."; return 1; fi
+  if [[ "$bhttp_port" == "$backend_port" ]]; then
+    error "El puerto BHTTP y el backend no pueden ser iguales."
+    return 1
+  fi
+
+  echo
+  echo "Búfer TCP en KB (0 = ajuste automático del sistema)."
+  read -r -p "Búfer de recepción [0]: " rcvbuf_kb
+  read -r -p "Búfer de envío [0]: " sndbuf_kb
+  read -r -p "Búfer de escritura asyncio [256]: " write_high_kb
+  rcvbuf_kb="${rcvbuf_kb:-0}"
+  sndbuf_kb="${sndbuf_kb:-0}"
+  write_high_kb="${write_high_kb:-256}"
+  write_low_kb=$((write_high_kb / 4))
+  for value in "$rcvbuf_kb" "$sndbuf_kb" "$write_high_kb"; do
+    if ! [[ "$value" =~ ^[0-9]+$ ]] || (( value > 16384 )); then
+      error "Búfer inválido. Usa un número entre 0 y 16384 KB."
+      return 1
+    fi
+  done
+  if (( write_high_kb < 16 )); then
+    error "El búfer de escritura debe ser al menos 16 KB."
+    return 1
+  fi
+
   if ! command -v python3 >/dev/null 2>&1; then
-    info "Instalando Python 3..."
-    if command -v apt-get >/dev/null 2>&1; then apt-get update && apt-get install -y python3
-    elif command -v dnf >/dev/null 2>&1; then dnf install -y python3
-    elif command -v yum >/dev/null 2>&1; then yum install -y python3
-    else err "Instala Python 3 manualmente."; return 1; fi
+    echo "Instalando Python 3..."
+    if command -v apt-get >/dev/null 2>&1; then
+      apt-get update
+      apt-get install -y python3
+    elif command -v dnf >/dev/null 2>&1; then
+      dnf install -y python3
+    elif command -v yum >/dev/null 2>&1; then
+      yum install -y python3
+    else
+      error "Instala Python 3 manualmente y vuelve a ejecutar."
+      return 1
+    fi
   fi
-  command -v systemctl >/dev/null 2>&1 || { err "Se requiere systemd."; return 1; }
+  if ! command -v systemctl >/dev/null 2>&1; then
+    error "Este instalador requiere systemd."
+    return 1
+  fi
+
   mkdir -p "$DESTDIR"
   cat > "$SERVER_PY" <<'PYEOF'
 #!/usr/bin/env python3
@@ -365,157 +330,81 @@ if __name__ == "__main__":
 PYEOF
   chmod 755 "$SERVER_PY"
   python3 -m py_compile "$SERVER_PY"
-  write_service
+
+  pybin="$(command -v python3)"
+  cat > "$UNIT" <<EOF
+[Unit]
+Description=BHTTP Server
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=$pybin $SERVER_PY --host 0.0.0.0 --port $bhttp_port --backend-host 127.0.0.1 --backend-port $backend_port --rcvbuf-kb $rcvbuf_kb --sndbuf-kb $sndbuf_kb --write-high-kb $write_high_kb
+Restart=always
+RestartSec=2
+TimeoutStopSec=20
+KillSignal=SIGINT
+LimitNOFILE=65535
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable "$SERVICE" >/dev/null
   systemctl restart "$SERVICE"
   sleep 2
+
   if systemctl is-active --quiet "$SERVICE"; then
-    save_config
-    ok "Servidor BHTTP instalado y activo."
-    info "BHTTP: $BHTTP_PORT  |  Backend SSH: 127.0.0.1:$BACKEND_PORT"
+    echo
+    echo "Instalación completada."
+    echo "Puerto BHTTP: $bhttp_port"
+    echo "Backend SSH: 127.0.0.1:$backend_port"
+    echo "Buffer recepción TCP: ${rcvbuf_kb} KB (0 = automático)"
+    echo "Buffer envío TCP: ${sndbuf_kb} KB (0 = automático)"
+    echo "Buffer escritura asyncio: ${write_high_kb} KB"
+    echo "Servicio: activo (reinicio automático habilitado)"
+    echo
+    echo "Asegúrate de permitir el puerto BHTTP en el firewall de la VPS/proveedor."
   else
-    err "BHTTP no pudo iniciar. Últimos registros:"
-    journalctl -u "$SERVICE" -n 25 --no-pager || true
+    error "BHTTP no pudo iniciar. Últimos registros:"
+    journalctl -u "$SERVICE" -n 30 --no-pager
     return 1
   fi
 }
-
-configure_ports(){
-  local v
-  echo; paint "$WHITE$BOLD" "  CONFIGURACIÓN DE PUERTOS"; echo; line
-  read -r -p "  Puerto público BHTTP [$BHTTP_PORT]: " v; v="${v:-$BHTTP_PORT}"
-  valid_port "$v" || { err "Puerto público inválido."; return; }; BHTTP_PORT=$((10#$v))
-  read -r -p "  Puerto backend SSH [$BACKEND_PORT]: " v; v="${v:-$BACKEND_PORT}"
-  valid_port "$v" || { err "Puerto backend inválido."; return; }; BACKEND_PORT=$((10#$v))
-  [[ "$BHTTP_PORT" != "$BACKEND_PORT" ]] || { err "Los puertos público y backend no deben coincidir."; return; }
-  apply_config
-}
-configure_buffers(){
-  local v
-  echo; paint "$WHITE$BOLD" "  AJUSTES DE RENDIMIENTO"; echo; line
-  info "Valores en KB. TCP 0 = automático; escritura y stream: 16–16384 KB."
-  read -r -p "  Buffer TCP recepción [$RCVBUF_KB]: " v; RCVBUF_KB="${v:-$RCVBUF_KB}"
-  valid_buffer "$RCVBUF_KB" || { err "Valor de recepción inválido."; return; }
-  read -r -p "  Buffer TCP envío [$SNDBUF_KB]: " v; SNDBUF_KB="${v:-$SNDBUF_KB}"
-  valid_buffer "$SNDBUF_KB" || { err "Valor de envío inválido."; return; }
-  read -r -p "  Buffer escritura asyncio [$WRITE_HIGH_KB]: " v; WRITE_HIGH_KB="${v:-$WRITE_HIGH_KB}"
-  [[ "$WRITE_HIGH_KB" =~ ^[0-9]+$ ]] && (( WRITE_HIGH_KB >= 16 && WRITE_HIGH_KB <= 16384 )) || { err "Valor de escritura fuera de rango."; return; }
-  read -r -p "  Límite de stream [$STREAM_LIMIT_KB]: " v; STREAM_LIMIT_KB="${v:-$STREAM_LIMIT_KB}"
-  [[ "$STREAM_LIMIT_KB" =~ ^[0-9]+$ ]] && (( STREAM_LIMIT_KB >= 16 && STREAM_LIMIT_KB <= 16384 )) || { err "Límite de stream fuera de rango."; return; }
-  apply_config
-}
-
-users_menu(){
-  local op u p key comment home
-  while true; do
-    banner; paint "$WHITE$BOLD" "  ADMINISTRACIÓN SSH"; echo; line
-    echo "  [1] Crear usuario SSH con contraseña"
-    echo "  [2] Autorizar clave pública SSH (identificación por huella)"
-    echo "  [3] Listar usuarios locales"
-    echo "  [4] Cambiar contraseña SSH"
-    echo "  [5] Eliminar usuario"
-    echo "  [0] Volver"; line
-    read -r -p "  Selecciona: " op
-    case "$op" in
-      1)
-        read -r -p "  Usuario: " u
-        [[ "$u" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { err "Nombre no válido."; pause; continue; }
-        if id "$u" >/dev/null 2>&1; then warn "El usuario ya existe."; else useradd -m -s /bin/bash "$u" || { err "No se pudo crear."; pause; continue; }; fi
-        read -r -s -p "  Contraseña: " p; echo
-        [[ -n "$p" ]] || { err "Contraseña vacía."; pause; continue; }
-        printf '%s:%s\n' "$u" "$p" | chpasswd && ok "Usuario SSH preparado." || err "No se pudo establecer la contraseña."
-        unset p; pause ;;
-      2)
-        read -r -p "  Usuario existente: " u
-        id "$u" >/dev/null 2>&1 || { err "Primero crea el usuario."; pause; continue; }
-        read -r -p "  Etiqueta del dispositivo (ej. movil-1): " comment
-        read -r -p "  Pega la clave pública SSH completa: " key
-        [[ "$key" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp[0-9]+)[[:space:]] ]] || { err "Formato de clave pública no reconocido."; pause; continue; }
-        home="$(getent passwd "$u" | cut -d: -f6)"
-        install -d -m 700 -o "$u" -g "$u" "$home/.ssh"
-        printf '%s %s\n' "$key" "${comment//[^a-zA-Z0-9_.-]/_}" >> "$home/.ssh/authorized_keys"
-        chown "$u:$u" "$home/.ssh/authorized_keys"; chmod 600 "$home/.ssh/authorized_keys"
-        ok "Clave autorizada. La huella identifica la clave, no el hardware físico."; pause ;;
-      3) awk -F: '$3>=1000 && $1!="nobody" {printf "  %-24s UID %s\\n",$1,$3}' /etc/passwd; pause ;;
-      4) read -r -p "  Usuario: " u; id "$u" >/dev/null 2>&1 || { err "Usuario inexistente."; pause; continue; }
-         read -r -s -p "  Nueva contraseña: " p; echo
-         [[ -n "$p" ]] && printf '%s:%s\n' "$u" "$p" | chpasswd && ok "Contraseña actualizada." || err "No se pudo actualizar."; unset p; pause ;;
-      5) read -r -p "  Usuario a eliminar: " u
-         [[ "$u" != root && "$u" != "${SUDO_USER:-}" ]] || { err "No se permite eliminar root ni el usuario administrador actual."; pause; continue; }
-         if id "$u" >/dev/null 2>&1; then userdel -r "$u" && ok "Usuario eliminado." || err "No se pudo eliminar."; else warn "Usuario no encontrado."; fi; pause ;;
-      0) return ;;
-      *) warn "Opción no válida."; sleep 1 ;;
-    esac
-  done
-}
-
-service_menu(){
-  local op
-  while true; do
-    banner; paint "$WHITE$BOLD" "  CONTROL DEL SERVICIO"; echo; line
-    echo "  [1] Iniciar"; echo "  [2] Detener"; echo "  [3] Reiniciar"; echo "  [4] Estado detallado"; echo "  [5] Ver registros en vivo"; echo "  [0] Volver"; line
-    read -r -p "  Selecciona: " op
-    case "$op" in
-      1) systemctl start "$SERVICE" && ok "Servicio iniciado." || err "No se pudo iniciar."; pause ;;
-      2) systemctl stop "$SERVICE" && ok "Servicio detenido." || err "No se pudo detener."; pause ;;
-      3) systemctl restart "$SERVICE" && ok "Servicio reiniciado." || err "No se pudo reiniciar."; pause ;;
-      4) systemctl status "$SERVICE" --no-pager || true; pause ;;
-      5) echo "  Ctrl+C para volver."; journalctl -u "$SERVICE" -f || true ;;
-      0) return ;;
-      *) warn "Opción no válida."; sleep 1 ;;
-    esac
-  done
-}
-
-diagnostics(){
-  banner; paint "$WHITE$BOLD" "  INFORMACIÓN Y DIAGNÓSTICO"; echo; line
-  echo "  BHTTP: $BHTTP_PORT"; echo "  Backend: 127.0.0.1:$BACKEND_PORT"
-  echo "  Buffer TCP RX: $RCVBUF_KB KB"; echo "  Buffer TCP TX: $SNDBUF_KB KB"
-  echo "  Escritura asyncio: $WRITE_HIGH_KB KB"; echo "  Stream limit: $STREAM_LIMIT_KB KB"
-  echo; systemctl is-active "$SERVICE" 2>/dev/null || true
-  echo; ss -ltnp 2>/dev/null | grep -E ":(${BHTTP_PORT}|${BACKEND_PORT})\\b" || true
-  echo; journalctl -u "$SERVICE" -n 15 --no-pager 2>/dev/null || true
-  pause
-}
-
-uninstall_server(){
-  local answer
-  read -r -p "  ¿Desinstalar BHTTP y su configuración? [s/N]: " answer
-  [[ "$answer" =~ ^[sS]$ ]] || return
+remove_server() {
+  read -r -p "¿Desinstalar BHTTP? [s/N]: " answer
+  [[ "$answer" =~ ^[sS]$ ]] || return 0
   systemctl disable --now "$SERVICE" 2>/dev/null || true
-  rm -f "$UNIT"; rm -rf "$DESTDIR"; rm -f "$CONF"
+  rm -f "$UNIT"
+  rm -rf "$DESTDIR"
   systemctl daemon-reload
-  ok "BHTTP desinstalado. Los usuarios SSH del sistema no se eliminan."
-  pause
+  echo "BHTTP desinstalado."
 }
-
-main_menu(){
-  local op
-  while true; do
-    banner
-    printf '%b\n' "  ${WHITE}${BOLD}MENÚ PRINCIPAL${RESET}"
-    echo "  [1] Instalar / reinstalar servidor"
-    echo "  [2] Cambiar puertos BHTTP / backend SSH"
-    echo "  [3] Ajustar búferes y rendimiento"
-    echo "  [4] Administrar usuarios SSH y claves de dispositivo"
-    echo "  [5] Control del servicio"
-    echo "  [6] Diagnóstico e información"
-    echo "  [7] Desinstalar BHTTP"
-    echo "  [0] Salir"; line
-    read -r -p "  Selecciona una opción: " op
-    case "$op" in
-      1) install_server; pause ;;
-      2) configure_ports; pause ;;
-      3) configure_buffers; pause ;;
-      4) users_menu ;;
-      5) service_menu ;;
-      6) diagnostics ;;
-      7) uninstall_server ;;
-      0) clear 2>/dev/null || true; echo "BHTTP Control Panel cerrado."; exit 0 ;;
-      *) warn "Opción no válida."; sleep 1 ;;
-    esac
-  done
+status_server() {
+  systemctl status "$SERVICE" --no-pager || true
 }
-
-need_root
-load_config
-main_menu
+logs_server() {
+  journalctl -u "$SERVICE" -f
+}
+main() {
+  need_root
+  case "${1:-install}" in
+    install) install_server ;;
+    uninstall) remove_server ;;
+    status) status_server ;;
+    logs) logs_server ;;
+    restart) systemctl restart "$SERVICE" ;;
+    stop) systemctl stop "$SERVICE" ;;
+    start) systemctl start "$SERVICE" ;;
+    *)
+      echo "Uso: bash $0 [install|uninstall|status|logs|restart|start|stop]"
+      exit 2
+      ;;
+  esac
+}
+main "$@"
